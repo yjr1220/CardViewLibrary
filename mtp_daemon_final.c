@@ -24,9 +24,9 @@
 #define EVENT_BUF_LEN (1024 * (EVENT_SIZE + 16))
 
 #define MAX_PATH_LEN 1024
-#define OPERATION_QUIET_TIME 2  // 操作静默时间2秒
-#define EVENT_CHECK_INTERVAL 500  // 事件检查间隔500ms
-#define MAX_EVENT_WAIT_TIME 10    // 最大事件等待时间10秒
+#define OPERATION_QUIET_TIME 2  // 2秒静默时间
+#define EVENT_CHECK_INTERVAL 200  // 200ms检查间隔
+#define BURST_COMMAND_COUNT 3   // 发送3个连续命令
 
 volatile sig_atomic_t daemon_running = 1;
 
@@ -54,18 +54,11 @@ enum {
     MTP_TOOLS_TYPE_DIR,
 };
 
-/* -------------------- 简化的操作状态跟踪 -------------------- */
+/* -------------------- 简化的状态跟踪 -------------------- */
 
-typedef struct {
-    char path[MAX_PATH_LEN];
-    time_t last_event_time;
-    time_t operation_start;
-    int event_count;
-    int has_pending_update;
-} operation_state_t;
-
-static operation_state_t operation_state;
-static pthread_mutex_t state_mutex = PTHREAD_MUTEX_INITIALIZER;
+static time_t last_activity = 0;
+static int pending_update = 0;
+static pthread_mutex_t simple_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* -------------------- Signals -------------------- */
 
@@ -111,62 +104,29 @@ static int ensure_fifo(const char *path) {
     return 0;
 }
 
-// 获取路径的父目录
-static void get_parent_directory(const char *path, char *parent, size_t parent_size) {
-    strncpy(parent, path, parent_size - 1);
-    parent[parent_size - 1] = '\0';
-    
-    char *last_slash = strrchr(parent, '/');
-    if (last_slash && last_slash != parent) {
-        *last_slash = '\0';
-    } else {
-        strncpy(parent, WATCH_DIR, parent_size - 1);
-        parent[parent_size - 1] = '\0';
-    }
-}
-
-// 获取最上层的变更目录
-static void get_top_level_change_dir(const char *path, char *result, size_t result_size) {
-    if (strncmp(path, WATCH_DIR, strlen(WATCH_DIR)) != 0) {
-        strncpy(result, WATCH_DIR, result_size - 1);
-        result[result_size - 1] = '\0';
-        return;
-    }
-    
-    const char *relative_path = path + strlen(WATCH_DIR);
-    if (relative_path[0] == '/') relative_path++;
-    
-    if (strlen(relative_path) == 0) {
-        strncpy(result, WATCH_DIR, result_size - 1);
-        result[result_size - 1] = '\0';
-        return;
-    }
-    
-    // 找到第一个目录分隔符
-    const char *first_slash = strchr(relative_path, '/');
-    if (first_slash) {
-        snprintf(result, result_size, "%s/%.*s", 
-                WATCH_DIR, (int)(first_slash - relative_path), relative_path);
-    } else {
-        snprintf(result, result_size, "%s/%s", WATCH_DIR, relative_path);
-    }
-}
-
 // 检测是否为临时文件
-static int is_temp_file(const char *filename) {
-    if (!filename) return 0;
+static int should_ignore_path(const char *path) {
+    if (!path) return 1;
     
-    // 检查常见的临时文件模式
+    if (strstr(path, "/.tmp/") || strstr(path, "\\.tmp\\")) {
+        return 1;
+    }
+    
+    const char *filename = strrchr(path, '/');
+    if (filename) filename++; else filename = path;
+    
     if (strstr(filename, ".tmp") || 
         strstr(filename, ".temp") ||
-        strncmp(filename, ".", 1) == 0) {
+        strstr(filename, ".part") ||
+        strstr(filename, "~") ||
+        (strncmp(filename, ".", 1) == 0 && strcmp(filename, "..") != 0) ||
+        (strlen(filename) > 10 && strspn(filename, "0123456789") == strlen(filename))) {
         return 1;
     }
     
     return 0;
 }
 
-// 获取事件类型描述
 static const char* get_event_type_name(struct inotify_event *event) {
     if (event->mask & IN_CREATE) return "CREATE";
     if (event->mask & IN_DELETE) return "DELETE";
@@ -223,153 +183,55 @@ static int mtp_tools_send_command(int fd, uint32_t action, uint32_t type, const 
     return (ret == (int)command_size) ? 0 : -1;
 }
 
-static int execute_mtp_command(const char *function, const char *type, const char *path) {
-    static int fifo_fd = -1;
-    int retry_count = 0;
-    const int MAX_RETRIES = 3;
+// 发送连续的MTP更新命令来触发MtpDaemon的epoll_wait
+static void send_mtp_update_burst(void) {
+    int fd = open(MTP_FIFO_NAME, O_WRONLY | O_NONBLOCK);
+    if (fd < 0) {
+        return;
+    }
     
-    while (retry_count < MAX_RETRIES) {
-        if (fifo_fd < 0) {
-            fifo_fd = open(MTP_FIFO_NAME, O_WRONLY | O_NONBLOCK);
-            if (fifo_fd < 0) {
-                printf("Failed to open MTP FIFO, retry %d\n", retry_count);
-                retry_count++;
-                usleep(100000); // 等待100ms
-                continue;
-            }
-        }
-        
-        uint32_t action;
-        uint32_t mtp_type;
-        
-        if (strcmp(function, "add") == 0) {
-            action = MTP_TOOLS_FUNCTION_ADD;
-        } else if (strcmp(function, "remove") == 0) {
-            action = MTP_TOOLS_FUNCTION_REMOVE;
-        } else if (strcmp(function, "update") == 0) {
-            action = MTP_TOOLS_FUNCTION_UPDATE;
-        } else {
-            return -1;
-        }
-        
-        if (strcmp(type, "FILE") == 0) {
-            mtp_type = MTP_TOOLS_TYPE_FILE;
-        } else if (strcmp(type, "DIR") == 0) {
-            mtp_type = MTP_TOOLS_TYPE_DIR;
-        } else {
-            return -1;
-        }
-        
-        printf("Sending MTP command: function=%s, type=%s, path=%s\n", function, type, path);
-        
-        int ret = mtp_tools_send_command(fifo_fd, action, mtp_type, path, NULL);
+    printf("Sending burst MTP update commands to trigger immediate response\n");
+    
+    // 发送多个UPDATE命令，确保触发MtpDaemon的epoll_wait
+    for (int i = 0; i < BURST_COMMAND_COUNT; i++) {
+        int ret = mtp_tools_send_command(fd, MTP_TOOLS_FUNCTION_UPDATE, MTP_TOOLS_TYPE_DIR, WATCH_DIR, NULL);
         if (ret >= 0) {
-            printf("MTP command sent successfully\n");
-            return 0;
-        } else {
-            printf("MTP command failed, closing FIFO and retrying...\n");
-            close(fifo_fd);
-            fifo_fd = -1;
-            retry_count++;
-            usleep(100000); // 等待100ms
+            printf("Burst command %d sent successfully\n", i + 1);
         }
+        usleep(50000); // 50ms间隔
     }
     
-    printf("MTP command failed after %d retries\n", MAX_RETRIES);
-    return -1;
+    close(fd);
+    printf("MTP update burst completed\n");
 }
 
-/* -------------------- 简化的操作跟踪 -------------------- */
+/* -------------------- 活动跟踪 -------------------- */
 
-static void mark_operation_activity(const char *path) {
-    pthread_mutex_lock(&state_mutex);
+static void mark_activity(void) {
+    pthread_mutex_lock(&simple_mutex);
+    last_activity = time(NULL);
+    pending_update = 1;
+    printf("Activity detected, marking for update\n");
+    pthread_mutex_unlock(&simple_mutex);
+}
+
+static void check_and_update(void) {
+    pthread_mutex_lock(&simple_mutex);
     
     time_t now = time(NULL);
     
-    // 如果是新操作或者路径发生变化，重新开始跟踪
-    if (operation_state.event_count == 0 || 
-        strcmp(operation_state.path, path) != 0) {
+    if (pending_update && (now - last_activity) >= OPERATION_QUIET_TIME) {
+        printf("Quiet time reached, sending MTP update burst\n");
+        pthread_mutex_unlock(&simple_mutex);
         
-        get_top_level_change_dir(path, operation_state.path, sizeof(operation_state.path));
-        operation_state.operation_start = now;
-        operation_state.event_count = 1;
-        operation_state.has_pending_update = 1;
+        send_mtp_update_burst();
         
-        printf("Operation started for path: %s\n", operation_state.path);
-    } else {
-        operation_state.event_count++;
-        operation_state.has_pending_update = 1;
+        pthread_mutex_lock(&simple_mutex);
+        pending_update = 0;
+        printf("Update completed\n");
     }
     
-    operation_state.last_event_time = now;
-    
-    pthread_mutex_unlock(&state_mutex);
-}
-
-static int check_and_send_update(void) {
-    pthread_mutex_lock(&state_mutex);
-    
-    time_t now = time(NULL);
-    int should_send = 0;
-    char update_path[MAX_PATH_LEN];
-    
-    if (operation_state.has_pending_update) {
-        // 检查是否有足够的静默时间
-        if ((now - operation_state.last_event_time) >= OPERATION_QUIET_TIME) {
-            should_send = 1;
-            strncpy(update_path, operation_state.path, sizeof(update_path) - 1);
-            update_path[sizeof(update_path) - 1] = '\0';
-            
-            // 重置状态
-            operation_state.has_pending_update = 0;
-            operation_state.event_count = 0;
-            
-            printf("Operation completed for path: %s (events: %d, duration: %ld seconds)\n", 
-                   update_path, operation_state.event_count, now - operation_state.operation_start);
-        }
-        // 检查是否超时
-        else if ((now - operation_state.operation_start) >= MAX_EVENT_WAIT_TIME) {
-            should_send = 1;
-            strncpy(update_path, operation_state.path, sizeof(update_path) - 1);
-            update_path[sizeof(update_path) - 1] = '\0';
-            
-            // 重置状态
-            operation_state.has_pending_update = 0;
-            operation_state.event_count = 0;
-            
-            printf("Operation timeout for path: %s (events: %d)\n", 
-                   update_path, operation_state.event_count);
-        }
-    }
-    
-    pthread_mutex_unlock(&state_mutex);
-    
-    if (should_send) {
-        execute_mtp_command("update", "DIR", update_path);
-        return 1;
-    }
-    
-    return 0;
-}
-
-/* -------------------- 立即处理删除操作 -------------------- */
-
-static void handle_deletion_immediately(const char *deleted_path) {
-    char update_path[MAX_PATH_LEN];
-    
-    // 对于删除操作，使用父目录进行更新
-    get_parent_directory(deleted_path, update_path, sizeof(update_path));
-    
-    // 如果父目录不存在，使用根目录
-    if (!directory_exists(update_path)) {
-        strncpy(update_path, WATCH_DIR, sizeof(update_path) - 1);
-        update_path[sizeof(update_path) - 1] = '\0';
-    }
-    
-    printf("Deletion detected: %s, updating parent: %s\n", deleted_path, update_path);
-    
-    // 立即发送删除更新
-    execute_mtp_command("update", "DIR", update_path);
+    pthread_mutex_unlock(&simple_mutex);
 }
 
 /* -------------------- Watch map (wd <-> path) -------------------- */
@@ -411,7 +273,6 @@ static void remove_watch_entry_by_wd(int wd) {
     }
 }
 
-// 根据路径前缀删除监控项
 static void remove_watch_entries_by_path_prefix(int inotify_fd, const char *path_prefix) {
     struct watch_entry *prev = NULL, *cur = watch_list;
     size_t prefix_len = strlen(path_prefix);
@@ -421,7 +282,6 @@ static void remove_watch_entries_by_path_prefix(int inotify_fd, const char *path
             (cur->path[prefix_len] == '/' || cur->path[prefix_len] == '\0')) {
             
             inotify_rm_watch(inotify_fd, cur->wd);
-            printf("Removed watch for deleted path: %s\n", cur->path);
             
             if (prev) {
                 prev->next = cur->next;
@@ -475,7 +335,7 @@ static int add_watch_recursive(int inotify_fd, const char *dirpath) {
     return 0;
 }
 
-/* -------------------- 简化的事件处理 -------------------- */
+/* -------------------- 事件处理 -------------------- */
 
 static void handle_inotify_event(int inotify_fd, struct inotify_event *event) {
     if (event->len == 0) return;
@@ -488,41 +348,36 @@ static void handle_inotify_event(int inotify_fd, struct inotify_event *event) {
         return;
     }
 
-    printf("Event: %s on %s (mask: 0x%x)\n", get_event_type_name(event), full_path, event->mask);
+    printf("Event: %s on %s\n", get_event_type_name(event), full_path);
 
     // 过滤临时文件
-    if (is_temp_file(event->name)) {
-        printf("Ignoring temp file: %s\n", event->name);
+    if (should_ignore_path(full_path)) {
+        printf("Ignoring temp file: %s\n", full_path);
         return;
     }
 
-    // 立即处理删除事件
-    if (event->mask & (IN_DELETE | IN_DELETE_SELF | IN_MOVED_FROM)) {
-        // 如果是目录删除，清理相关的监控项
-        if (event->mask & IN_ISDIR) {
+    // 处理所有有效事件
+    if (event->mask & (IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY | 
+                      IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE)) {
+        
+        // 如果是目录删除，清理监控项
+        if ((event->mask & (IN_DELETE | IN_DELETE_SELF)) && (event->mask & IN_ISDIR)) {
             remove_watch_entries_by_path_prefix(inotify_fd, full_path);
         }
         
-        // 立即处理删除
-        handle_deletion_immediately(full_path);
-        return;
-    }
-    
-    // 处理其他事件（创建、修改、移动到等）
-    if (event->mask & (IN_CREATE | IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO)) {
-        mark_operation_activity(full_path);
-        
-        // 如果是目录创建或移动到，需要添加监控
-        if ((event->mask & IN_ISDIR) && (event->mask & (IN_CREATE | IN_MOVED_TO))) {
+        // 如果是目录创建，添加监控
+        if ((event->mask & IN_CREATE) && (event->mask & IN_ISDIR)) {
             add_watch_recursive(inotify_fd, full_path);
         }
+        
+        // 标记活动
+        mark_activity();
     }
 }
 
 /* -------------------- Inotify Recovery -------------------- */
 
 static int recover_inotify_watches(int inotify_fd) {
-    // 清理旧的watch列表
     while (watch_list) {
         inotify_rm_watch(inotify_fd, watch_list->wd);
         struct watch_entry *tmp = watch_list;
@@ -530,7 +385,6 @@ static int recover_inotify_watches(int inotify_fd) {
         free(tmp);
     }
     
-    // 重新添加监控
     return add_watch_recursive(inotify_fd, WATCH_DIR);
 }
 
@@ -563,40 +417,49 @@ static void daemonize(void) {
 /* -------------------- Main -------------------- */
 
 int main(int argc, char *argv[]) {
-    int inotify_fd;
+    printf("=== MTP File System Monitor Daemon ===\n");
+    printf("Version: Final Optimized (Burst Mode)\n");
+    printf("Watch Directory: %s\n", WATCH_DIR);
+    printf("Quiet Time: %d seconds\n", OPERATION_QUIET_TIME);
+    printf("Check Interval: %dms\n", EVENT_CHECK_INTERVAL);
+    printf("Burst Commands: %d\n", BURST_COMMAND_COUNT);
+    printf("=====================================\n");
 
     if (!directory_exists(WATCH_DIR)) {
-        printf("Watch directory %s does not exist\n", WATCH_DIR);
+        printf("ERROR: Watch directory does not exist: %s\n", WATCH_DIR);
         return EXIT_FAILURE;
     }
+    
     if (ensure_fifo(MTP_FIFO_NAME) != 0) {
-        printf("Failed to create MTP FIFO %s\n", MTP_FIFO_NAME);
+        printf("ERROR: Failed to ensure FIFO exists: %s\n", MTP_FIFO_NAME);
         return EXIT_FAILURE;
     }
 
+    // 检查是否以daemon模式运行
     if (!(argc > 1 && strcmp(argv[1], "--no-daemon") == 0)) {
+        printf("Starting in daemon mode...\n");
         daemonize();
+    } else {
+        printf("Starting in foreground mode (debug)...\n");
     }
 
     setup_signal_handlers();
 
-    inotify_fd = inotify_init1(IN_NONBLOCK);
+    int inotify_fd = inotify_init1(IN_NONBLOCK);
     if (inotify_fd < 0) {
-        printf("Failed to initialize inotify\n");
+        printf("ERROR: Failed to initialize inotify\n");
         return EXIT_FAILURE;
     }
 
     if (add_watch_recursive(inotify_fd, WATCH_DIR) != 0) {
-        printf("Failed to add recursive watch for %s\n", WATCH_DIR);
+        printf("ERROR: Failed to add recursive watch for %s\n", WATCH_DIR);
         close(inotify_fd);
         return EXIT_FAILURE;
     }
 
-    printf("MTP daemon started, watching %s\n", WATCH_DIR);
+    printf("MTP daemon started successfully\n");
+    printf("Monitoring file system changes...\n");
 
-    int inotify_recover_count = 0;
-    const int MAX_RECOVER_ATTEMPTS = 3;
-    
     while (daemon_running) {
         fd_set read_fds;
         struct timeval timeout;
@@ -610,20 +473,12 @@ int main(int argc, char *argv[]) {
         int ret = select(inotify_fd + 1, &read_fds, NULL, NULL, &timeout);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            
-            if (inotify_recover_count < MAX_RECOVER_ATTEMPTS) {
-                printf("Select error, attempting recovery...\n");
-                sleep(1);
-                if (recover_inotify_watches(inotify_fd) == 0) {
-                    inotify_recover_count++;
-                    continue;
-                }
-            }
+            printf("ERROR: Select failed: %s\n", strerror(errno));
             break;
         }
 
-        // 定期检查是否有待发送的更新
-        check_and_send_update();
+        // 检查是否需要发送更新
+        check_and_update();
         
         if (ret == 0) continue;
 
@@ -641,19 +496,10 @@ int main(int argc, char *argv[]) {
             }
             
             if (length < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                if (inotify_recover_count < MAX_RECOVER_ATTEMPTS) {
-                    printf("Read error, attempting recovery...\n");
-                    sleep(1);
-                    if (recover_inotify_watches(inotify_fd) == 0) {
-                        inotify_recover_count++;
-                        continue;
-                    }
-                }
+                printf("ERROR: Inotify read failed: %s\n", strerror(errno));
                 break;
             }
         }
-        
-        inotify_recover_count = 0;
     }
 
     printf("MTP daemon shutting down...\n");
@@ -669,5 +515,6 @@ int main(int argc, char *argv[]) {
     close(inotify_fd);
     remove(PID_FILE);
 
+    printf("MTP daemon shutdown complete\n");
     return EXIT_SUCCESS;
 }
